@@ -1,2 +1,6 @@
-beautifulsoup4
 requests
+beautifulsoup4
+pyyaml
+python-dotenv
+pytest
+discord.py
