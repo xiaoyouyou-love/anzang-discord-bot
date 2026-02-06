@@ -9,85 +9,87 @@ SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 MACRO_TIMEFRAME = "4h"
 MACRO_LIMIT = 500
 MICRO_TIMEFRAME = "1m"
-MICRO_LIMIT = 2000
+MICRO_LIMIT = 1500
+MICRO_SCAN_MINUTES = range(15, 91)
 OUTPUT_PATH = "/root/my_data/market_report.txt"
-MACRO_SMA_LENGTHS = [55, 144, 233]
 
 
-def fetch_ohlcv(
-    exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int
-) -> pd.DataFrame:
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(
-        ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df = df.sort_values("timestamp").set_index("timestamp")
-    return df
+def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    return df.sort_values("timestamp").set_index("timestamp")
 
 
-def add_sma(df: pd.DataFrame, lengths: list[int]) -> pd.DataFrame:
-    result = df.copy()
-    for length in lengths:
-        result[f"SMA_{length}"] = result["close"].rolling(window=length).mean()
-    return result
+def add_sma(df: pd.DataFrame, length: int, source: str = "close") -> pd.Series:
+    return df[source].rolling(window=length, min_periods=length).mean()
 
 
-def analyze_macro_trend(macro_df: pd.DataFrame) -> tuple[str, str]:
-    macro_df = add_sma(macro_df, MACRO_SMA_LENGTHS)
-    latest = macro_df.iloc[-1]
-    price = latest["close"]
-    sma144 = latest["SMA_144"]
-    sma233 = latest["SMA_233"]
-
-    if price > sma144 and price > sma233:
-        return "bull", "🌊 大趋势(4H): 🐂 牛市 (价格在 SMA 144/233 上方)"
+def macro_trend_label(price: float, sma144: float, sma233: float) -> tuple[str, str]:
     if price < sma144 and price < sma233:
-        return "bear", "🌊 大趋势(4H): 🐻 熊市 (价格在 SMA 144/233 下方)"
-    return "range", "🌊 大趋势(4H): ⚖️ 震荡 (价格在 SMA 144/233 附近)"
+        return "bear", "🔴 熊市 (SMA 144/233 压制中)"
+    if price > sma144 and price > sma233:
+        return "bull", "🟢 牛市 (SMA 144/233 支撑中)"
+    return "range", "🟡 震荡 (SMA 144/233 缠绕区)"
 
 
-def resample_ohlcv(micro_df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+def analyze_macro(df_4h: pd.DataFrame) -> dict:
+    result = df_4h.copy()
+    result["SMA_55"] = add_sma(result, 55)
+    result["SMA_144"] = add_sma(result, 144)
+    result["SMA_233"] = add_sma(result, 233)
+
+    valid = result.dropna(subset=["SMA_144", "SMA_233"])
+    if valid.empty:
+        return {
+            "trend_key": "range",
+            "trend_text": "⚠️ 数据不足 (4H K线不足以计算 SMA 144/233)",
+            "latest": None,
+        }
+
+    latest = valid.iloc[-1]
+    trend_key, trend_text = macro_trend_label(latest["close"], latest["SMA_144"], latest["SMA_233"])
+    return {"trend_key": trend_key, "trend_text": trend_text, "latest": latest}
+
+
+def resample_ohlcv(df_1m: pd.DataFrame, minutes: int) -> pd.DataFrame:
     rule = f"{minutes}min"
     sampled = (
-        micro_df.resample(rule)
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
+        df_1m.resample(rule)
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
         .dropna(subset=["open", "high", "low", "close"])
     )
     return sampled
 
 
-def find_best_fit_timeframe(micro_df: pd.DataFrame) -> dict | None:
-    best: dict | None = None
+def find_best_kiss(df_1m: pd.DataFrame, trend_key: str) -> dict | None:
+    best = None
 
-    for minutes in range(1, 61):
-        sampled = resample_ohlcv(micro_df, minutes)
-        sampled["SMA_5"] = sampled["close"].rolling(window=5).mean()
-        sampled["SMA_13"] = sampled["close"].rolling(window=13).mean()
+    for minutes in MICRO_SCAN_MINUTES:
+        sampled = resample_ohlcv(df_1m, minutes)
+        if len(sampled) < 13:
+            continue
+
+        sampled["SMA_5"] = add_sma(sampled, 5)
+        sampled["SMA_13"] = add_sma(sampled, 13)
 
         valid = sampled.dropna(subset=["SMA_5", "SMA_13"])
-        if len(valid) < 2:
+        if valid.empty:
             continue
 
         latest = valid.iloc[-1]
-        prev = valid.iloc[-2]
-        gap = abs(latest["SMA_5"] - latest["SMA_13"])
 
+        if trend_key == "bear" and not (latest["SMA_5"] < latest["SMA_13"]):
+            continue
+        if trend_key == "bull" and not (latest["SMA_5"] > latest["SMA_13"]):
+            continue
+
+        gap = abs(latest["SMA_5"] - latest["SMA_13"])
         candidate = {
             "minutes": minutes,
             "gap": gap,
-            "latest_sma5": latest["SMA_5"],
-            "latest_sma13": latest["SMA_13"],
-            "prev_sma5": prev["SMA_5"],
-            "prev_sma13": prev["SMA_13"],
+            "sma5": latest["SMA_5"],
+            "sma13": latest["SMA_13"],
         }
 
         if best is None or candidate["gap"] < best["gap"]:
@@ -96,74 +98,76 @@ def find_best_fit_timeframe(micro_df: pd.DataFrame) -> dict | None:
     return best
 
 
-def describe_kiss(best_fit: dict, trend_key: str) -> tuple[str, str]:
-    sma5 = best_fit["latest_sma5"]
-    sma13 = best_fit["latest_sma13"]
-    prev_gap = abs(best_fit["prev_sma5"] - best_fit["prev_sma13"])
-    gap = best_fit["gap"]
+def format_kiss_status(best_kiss: dict, trend_key: str) -> tuple[str, str]:
+    gap = best_kiss["gap"]
 
-    approaching = gap <= prev_gap
-    if approaching:
-        emoji = "🟢"
-        vibe = "欲拒还迎"
+    if gap <= 2:
+        kiss_text = f"🟢 完美相切 (Gap={gap:.4f}, 拒绝死叉)"
+    elif gap <= 8:
+        kiss_text = f"🟡 临近相切 (Gap={gap:.4f}, 趋势保持)"
     else:
-        emoji = "🟡"
-        vibe = "轻微背离"
-
-    if sma5 >= sma13:
-        relation = "SMA5回踩SMA13未破"
-    else:
-        relation = "SMA5反抽SMA13未破"
+        kiss_text = f"🟠 偏离相切 (Gap={gap:.4f}, 需继续等待)"
 
     if trend_key == "bull":
-        suggestion = "这是一个完美的第3/5段做多切入点！"
+        suggestion = "这是第3/5段的潜在做多切入位置。"
     elif trend_key == "bear":
-        suggestion = "这是一个完美的第3/5段做空切入点！"
+        suggestion = "这是第3/5段的潜在做空切入位置。"
     else:
-        suggestion = "趋势未明，建议轻仓等待确认后再介入。"
+        suggestion = "宏观震荡期，建议降低仓位并等待进一步确认。"
 
-    status = f"{emoji} {vibe} (Gap={gap:.4f}, {relation})"
-    return status, suggestion
+    return kiss_text, suggestion
 
 
 def analyze_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
-    macro_df = fetch_ohlcv(exchange, symbol, timeframe=MACRO_TIMEFRAME, limit=MACRO_LIMIT)
-    trend_key, trend_line = analyze_macro_trend(macro_df)
+    macro_df = fetch_ohlcv(exchange, symbol, MACRO_TIMEFRAME, MACRO_LIMIT)
+    macro = analyze_macro(macro_df)
 
-    micro_df = fetch_ohlcv(exchange, symbol, timeframe=MICRO_TIMEFRAME, limit=MICRO_LIMIT)
-    best_fit = find_best_fit_timeframe(micro_df)
+    micro_df = fetch_ohlcv(exchange, symbol, MICRO_TIMEFRAME, MICRO_LIMIT)
+    best_kiss = find_best_kiss(micro_df, macro["trend_key"])
 
-    if best_fit is None:
-        micro_block = (
-            "🎯 最佳相切点: 数据不足\n"
-            "   - 状态: ⚠️ 无法计算（部分周期下 SMA13 数据不足）\n"
-            "   - 建议: 等待更多 1m K 线后重试。"
+    lines = [
+        f"币种: {symbol}",
+        f"🌊 宏观趋势 (4H): {macro['trend_text']}",
+        "-----------------------------------------",
+        "🔬 微观相切扫描 (15m - 90m):",
+    ]
+
+    if best_kiss is None:
+        lines.extend(
+            [
+                "   🏆 最佳相切点: 无有效周期",
+                "   📏 状态: ⚠️ 由于周期过大或趋势过滤，无可用 SMA5/SMA13 相切结果",
+                "   💡 建议: 等待更多 1m 数据或趋势重新排列后再扫描。",
+            ]
         )
     else:
-        status, suggestion = describe_kiss(best_fit, trend_key)
-        micro_block = (
-            f"🎯 最佳相切点: 在 [{best_fit['minutes']}分钟] 级别\n"
-            f"   - 状态: {status}\n"
-            f"   - 建议: {suggestion}"
+        status, suggestion = format_kiss_status(best_kiss, macro["trend_key"])
+        lines.extend(
+            [
+                f"   🏆 最佳相切点: [{best_kiss['minutes']}分钟] 级别",
+                f"   📏 状态: {status}",
+                f"   💡 建议: {suggestion}",
+            ]
         )
 
-    return f"[{symbol}]\n{trend_line}\n{micro_block}\n"
+    lines.append("-----------------------------------------")
+    return "\n".join(lines)
 
 
 def build_report() -> str:
     exchange = ccxt.binance({"enableRateLimit": True})
     sections = [analyze_symbol(exchange, symbol) for symbol in SYMBOLS]
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    header = f"加密市场宏观+微观扫描报告（{timestamp}）\n"
-    return header + "\n".join(sections)
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"=== 🛡️ 林总均线系统扫描 ({ts} UTC时间) ==="
+    return f"{header}\n" + "\n".join(sections) + "\n"
 
 
-def write_report(report: str, path: str) -> None:
+def write_report(path: str, content: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        file.write(report)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
 if __name__ == "__main__":
-    report_content = build_report()
-    write_report(report_content, OUTPUT_PATH)
+    report = build_report()
+    write_report(OUTPUT_PATH, report)
