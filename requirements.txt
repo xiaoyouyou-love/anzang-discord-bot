@@ -6,3 +6,4 @@ pytest
 discord.py
 ccxt
 pandas
+mplfinance

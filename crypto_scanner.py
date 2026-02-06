@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 
 import ccxt
+import mplfinance as mpf
 import pandas as pd
 
 
@@ -12,6 +13,10 @@ MICRO_TIMEFRAME = "1m"
 MICRO_LIMIT = 1500
 MICRO_SCAN_MINUTES = range(15, 91)
 OUTPUT_PATH = "/root/my_data/market_report.txt"
+CHART_OUTPUTS = {
+    "BTC/USDT": "/root/anzang-discord-bot/btc_kiss.png",
+    "ETH/USDT": "/root/anzang-discord-bot/eth_kiss.png",
+}
 
 
 def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
@@ -118,6 +123,45 @@ def format_kiss_status(best_kiss: dict, trend_key: str) -> tuple[str, str]:
     return kiss_text, suggestion
 
 
+def auto_plot_best_kiss(symbol: str, df_1m: pd.DataFrame, minutes: int) -> bool:
+    output_path = CHART_OUTPUTS.get(symbol)
+    if output_path is None:
+        return False
+
+    sampled = resample_ohlcv(df_1m, minutes)
+    if len(sampled) < 13:
+        return False
+
+    sampled["SMA_5"] = add_sma(sampled, 5)
+    sampled["SMA_13"] = add_sma(sampled, 13)
+    chart_df = sampled.dropna(subset=["SMA_5", "SMA_13"]).tail(240)
+    if chart_df.empty:
+        return False
+
+    mpf_df = chart_df[["open", "high", "low", "close", "volume"]].rename(
+        columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}
+    )
+
+    addplots = [
+        mpf.make_addplot(chart_df["SMA_5"], color="white", width=1.2),
+        mpf.make_addplot(chart_df["SMA_13"], color="yellow", width=1.2),
+    ]
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    mpf.plot(
+        mpf_df,
+        type="candle",
+        style="nightclouds",
+        title=f"{symbol.split('/')[0]} - {minutes}min Best Kiss Setup",
+        addplot=addplots,
+        volume=True,
+        figsize=(16, 9),
+        tight_layout=True,
+        savefig={"fname": output_path, "dpi": 220},
+    )
+    return True
+
+
 def analyze_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
     macro_df = fetch_ohlcv(exchange, symbol, MACRO_TIMEFRAME, MACRO_LIMIT)
     macro = analyze_macro(macro_df)
@@ -142,6 +186,7 @@ def analyze_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
         )
     else:
         status, suggestion = format_kiss_status(best_kiss, macro["trend_key"])
+        chart_created = auto_plot_best_kiss(symbol, micro_df, best_kiss["minutes"])
         lines.extend(
             [
                 f"   🏆 最佳相切点: [{best_kiss['minutes']}分钟] 级别",
@@ -149,6 +194,8 @@ def analyze_symbol(exchange: ccxt.Exchange, symbol: str) -> str:
                 f"   💡 建议: {suggestion}",
             ]
         )
+        if chart_created:
+            lines.append("   📸 对应的相切分析图已生成，请输入 !chart 查看。")
 
     lines.append("-----------------------------------------")
     return "\n".join(lines)
