@@ -3,7 +3,6 @@ from datetime import datetime
 
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 
 
 SYMBOLS = ["BTC/USDT", "ETH/USDT"]
@@ -24,7 +23,7 @@ def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str) -> pd.DataFrame:
 
 def add_sma_indicators(df: pd.DataFrame) -> pd.DataFrame:
     for length in SMA_LENGTHS:
-        df[f"SMA_{length}"] = ta.sma(df["close"], length=length)
+        df[f"SMA_{length}"] = df["close"].rolling(window=length).mean()
     return df
 
 
