@@ -6,4 +6,3 @@ pytest
 discord.py
 ccxt
 pandas
-pandas_ta
